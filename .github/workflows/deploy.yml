@@ -1,0 +1,91 @@
+# Builds the site and deploys it to your S3 bucket — with no access keys.
+#
+# GitHub gives this job a short-lived OpenID Connect token (id-token: write).
+# configure-aws-credentials trades it with AWS STS for one-hour-or-less
+# credentials of the role in AWS_ROLE_ARN, which trusts only this repository.
+#
+# Set two repository VARIABLES (Settings → Secrets and variables → Actions →
+# Variables). Neither is a secret:
+#   AWS_ROLE_ARN   the ARN of your deploy role
+#   BUCKET         your bucket's name
+name: Deploy to S3
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # ask GitHub for the OIDC token
+  contents: read    # read this repository, nothing more
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A push before both variables are set (a new repository's first commit
+    # included) skips the job rather than failing it. Run workflow always
+    # runs, so a missing variable is named by the check below.
+    if: github.event_name == 'workflow_dispatch' || (vars.AWS_ROLE_ARN != '' && vars.BUCKET != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      BUCKET: ${{ vars.BUCKET }}
+    steps:
+      - name: Check the repository variables
+        run: |
+          missing=""
+          [ -n "$AWS_ROLE_ARN" ] || missing="$missing AWS_ROLE_ARN"
+          [ -n "$BUCKET" ] || missing="$missing BUCKET"
+          if [ -n "$missing" ]; then
+            echo "::error::Set the repository variables first:$missing (Settings > Secrets and variables > Actions > Variables)."
+            exit 1
+          fi
+          if ! printf '%s' "$BUCKET" | grep -Eq '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'; then
+            echo "::error::BUCKET must be a bucket name, not a URL or an ARN."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Record this deploy
+        run: |
+          mkdir -p dist/.deploy
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "run-id=$GITHUB_RUN_ID"
+            echo "commit=$GITHUB_SHA"
+          } > dist/.deploy/last-run.txt
+          cat dist/.deploy/last-run.txt
+
+      - name: Assume the deploy role with OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-${{ github.run_id }}
+          role-duration-seconds: 900
+          aws-region: us-east-1
+
+      - name: Who am I now?
+        run: aws sts get-caller-identity
+
+      - name: Upload the site
+        run: aws s3 sync dist/ "s3://$BUCKET" --delete
+
+      - name: Open the site
+        run: echo "http://$BUCKET.s3-website-us-east-1.amazonaws.com"
